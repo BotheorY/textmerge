@@ -4,8 +4,8 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetSystemTime};
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -28,11 +28,22 @@ pub fn error(message: &str) -> Option<PathBuf> {
             let _ = fs::rename(&path, directory.join("TextMerge-errors.previous.log"));
         }
         if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(&path) {
-            let seconds = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if writeln!(log, "[{seconds} UTC unix seconds] {message}").is_ok() {
+            let mut timestamp = SYSTEMTIME::default();
+            // SAFETY: GetSystemTime fills a valid writable SYSTEMTIME structure.
+            // Keep UTC while using MySQL's YYYY-MM-DD HH:MM:SS representation.
+            unsafe { GetSystemTime(&mut timestamp) };
+            if writeln!(
+                log,
+                "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {message}",
+                timestamp.wYear,
+                timestamp.wMonth,
+                timestamp.wDay,
+                timestamp.wHour,
+                timestamp.wMinute,
+                timestamp.wSecond,
+            )
+            .is_ok()
+            {
                 return Some(path);
             }
         }

@@ -2,8 +2,8 @@
 1 ICON "textmerge.ico"
 1 RT_MANIFEST "textmerge.manifest"
 1 VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,0,1,0
+ PRODUCTVERSION 1,0,1,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -13,8 +13,8 @@ BEGIN
   BEGIN
    VALUE "FileDescription", "TextMerge - portable text merger\0"
    VALUE "ProductName", "TextMerge\0"
-   VALUE "FileVersion", "1.0.0\0"
-   VALUE "ProductVersion", "1.0.0\0"
+   VALUE "FileVersion", "1.0.1\0"
+   VALUE "ProductVersion", "1.0.1\0"
    VALUE "OriginalFilename", "TextMerge.exe\0"
    VALUE "LegalCopyright", "TextMerge contributors. MIT License.\0"
   END

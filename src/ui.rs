@@ -122,12 +122,19 @@ impl App {
     }
     fn add(&mut self, id: i32, class: &str, text: &str, style: u32) -> Result<()> {
         let instance = unsafe { GetModuleHandleW(null()) };
+        let group_box = class == "BUTTON" && style & BS_TYPEMASK as u32 == BS_GROUPBOX as u32;
         let window = unsafe {
             CreateWindowExW(
-                if class == "EDIT" { WS_EX_CLIENTEDGE } else { 0 },
+                if class == "EDIT" {
+                    WS_EX_CLIENTEDGE
+                } else if group_box {
+                    WS_EX_TRANSPARENT
+                } else {
+                    0
+                },
                 wide(class).as_ptr(),
                 wide(text).as_ptr(),
-                WS_CHILD | WS_VISIBLE | style,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
                 0,
                 0,
                 0,
@@ -144,7 +151,14 @@ impl App {
             std::io::Error::last_os_error()
         );
         unsafe {
-            SendMessageW(window, WM_SETFONT, self.fonts[0] as usize, 1);
+            let font = self.fonts[if id == 1 {
+                1
+            } else if id == STATUS {
+                2
+            } else {
+                0
+            }];
+            SendMessageW(window, WM_SETFONT, font as usize, 0);
         }
         self.controls.insert(id, window);
         Ok(())
@@ -306,7 +320,7 @@ impl App {
                     } else {
                         0
                     }] as usize,
-                    1,
+                    0,
                 );
             }
         }
@@ -320,22 +334,23 @@ impl App {
     fn layout(&self) {
         let mut rect = RECT::default();
         unsafe {
-            GetClientRect(self.window, &mut rect);
+            if GetClientRect(self.window, &mut rect) == 0 || rect.right <= 0 || rect.bottom <= 0 {
+                return;
+            }
         }
         let width = rect.right as f64 / self.scale;
         let panel = width as i32 - 48;
-        let place = |id: i32, x: i32, y: i32, w: i32, h: i32| {
+        let mut placements = Vec::with_capacity(self.controls.len());
+        let mut place = |id: i32, x: i32, y: i32, w: i32, h: i32| {
             if let Some(&window) = self.controls.get(&id) {
-                unsafe {
-                    MoveWindow(
-                        window,
-                        (x as f64 * self.scale) as i32,
-                        (y as f64 * self.scale) as i32,
-                        (w as f64 * self.scale) as i32,
-                        (h as f64 * self.scale) as i32,
-                        1,
-                    );
-                }
+                placements.push((
+                    id,
+                    window,
+                    (x as f64 * self.scale).round() as i32,
+                    (y as f64 * self.scale).round() as i32,
+                    (w as f64 * self.scale).round().max(1.0) as i32,
+                    (h as f64 * self.scale).round().max(1.0) as i32,
+                ));
             }
         };
         place(1, 28, 20, panel, 42);
@@ -363,13 +378,52 @@ impl App {
         place(START, 28, 696, 160, 36);
         place(PAUSE, 200, 696, 100, 36);
         place(CANCEL, 312, 696, 100, 36);
+        // Group boxes overlap their contents as sibling windows. Keep their
+        // frames behind every interactive control, and clip sibling painting.
+        // Redrawing controls during individual MoveWindow calls lets a group
+        // background erase fields already painted at their new dimensions.
+        let flags = |id| {
+            SWP_NOACTIVATE
+                | SWP_NOREDRAW
+                | SWP_NOCOPYBITS
+                | if id == 3 || id == 4 { 0 } else { SWP_NOZORDER }
+        };
+        let after = |id| {
+            if id == 3 || id == 4 {
+                HWND_BOTTOM
+            } else {
+                null_mut()
+            }
+        };
         unsafe {
-            SendMessageW(self.controls[&1], WM_SETFONT, self.fonts[1] as usize, 1);
-            SendMessageW(
-                self.controls[&STATUS],
-                WM_SETFONT,
-                self.fonts[2] as usize,
-                1,
+            let mut batch = BeginDeferWindowPos(placements.len() as i32);
+            for &(id, window, x, y, width, height) in &placements {
+                if batch.is_null() {
+                    break;
+                }
+                batch = DeferWindowPos(batch, window, after(id), x, y, width, height, flags(id));
+            }
+            // A failed DeferWindowPos invalidates the batch handle. Reapply the
+            // entire layout individually, still suppressing intermediate paint.
+            let applied = !batch.is_null() && EndDeferWindowPos(batch) != 0;
+            if !applied {
+                for &(id, window, x, y, width, height) in &placements {
+                    if SetWindowPos(window, after(id), x, y, width, height, flags(id)) == 0 {
+                        logging::error(&format!(
+                            "Cannot resize control {id}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                }
+            }
+            // Invalidate the background, child clients, and edit-control borders
+            // together. In particular, WS_CLIPCHILDREN alone does not invalidate
+            // children when the parent is restored from its maximized state.
+            RedrawWindow(
+                self.window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
             );
         }
     }
@@ -731,7 +785,7 @@ unsafe extern "system" fn window_proc(
                     Some(0)
                 }
                 WM_SIZE => {
-                    if !app.controls.is_empty() {
+                    if wparam != SIZE_MINIMIZED as usize && !app.controls.is_empty() {
                         app.layout();
                     }
                     Some(0)
@@ -862,5 +916,208 @@ pub fn run() -> Result<()> {
         }
         CoUninitialize();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercise the application's own native controls in an off-screen test
+    /// window. No existing application or user window is automated.
+    #[test]
+    fn resize_restore_preserves_control_layers_and_invalidates_children() {
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let common = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&common), 0);
+            let instance = GetModuleHandleW(null());
+            let name = wide("TextMerge.LayoutRegressionTest");
+            let class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                lpszClassName: name.as_ptr(),
+                ..zeroed()
+            };
+            assert_ne!(RegisterClassExW(&class), 0);
+            let window = CreateWindowExW(
+                0,
+                name.as_ptr(),
+                name.as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                -32000,
+                -32000,
+                900,
+                820,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!window.is_null());
+            let mut app = Box::new(App {
+                window,
+                controls: HashMap::new(),
+                fonts: Vec::new(),
+                settings: Settings::default(),
+                job: None,
+                closing: false,
+                scale: GetDpiForWindow(window) as f64 / 96.0,
+            });
+            app.create_controls().unwrap();
+            app.set_text(SOURCE_A, "C:\\Example\\source A.txt");
+            app.set_text(SOURCE_B, "C:\\Example\\source B.txt");
+            app.set_text(TARGET, "C:\\Example\\merged.txt");
+            SendMessageW(app.controls[&CASE], CB_SETCURSEL, 1, 0);
+            SendMessageW(app.controls[&ORDER], CB_SETCURSEL, 2, 0);
+            SendMessageW(app.controls[&EOL], CB_SETCURSEL, 1, 0);
+            SendMessageW(app.controls[&BAR], PBM_SETPOS, 623, 0);
+            SetWindowLongPtrW(window, GWLP_USERDATA, (&mut *app as *mut App) as isize);
+            // Child invalidation follows the WS_VISIBLE ancestor chain. Keep
+            // that chain real while leaving the test outside the desktop area.
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+
+            struct Cleanup(Box<App>);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        SetWindowLongPtrW(self.0.window, GWLP_USERDATA, 0);
+                        DestroyWindow(self.0.window);
+                        for font in self.0.fonts.drain(..) {
+                            DeleteObject(font);
+                        }
+                    }
+                }
+            }
+            let app = Cleanup(app);
+            let settings_before = app.0.collect_settings();
+            let mut restored_bounds = HashMap::new();
+            for (&id, &control) in &app.0.controls {
+                let mut bounds = RECT::default();
+                assert_ne!(GetWindowRect(control, &mut bounds), 0);
+                MapWindowPoints(null_mut(), window, (&mut bounds as *mut RECT).cast(), 2);
+                restored_bounds.insert(id, bounds);
+            }
+
+            // Repeat enlarged/restored client sizes, including 125%/150%/200%
+            // style widths. SetWindowPos delivers real WM_SIZE notifications.
+            for (width, height) in [
+                (1920, 1080),
+                (900, 820),
+                (2400, 1350),
+                (900, 820),
+                (2880, 1620),
+                (900, 820),
+            ] {
+                for &control in app.0.controls.values() {
+                    ValidateRect(control, null());
+                }
+                assert_ne!(
+                    SetWindowPos(
+                        window,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        height,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+                    ),
+                    0
+                );
+
+                let mut order = Vec::new();
+                let mut child = GetWindow(window, GW_CHILD);
+                while !child.is_null() {
+                    order.push(child);
+                    child = GetWindow(child, GW_HWNDNEXT);
+                }
+                for group in [3, 4] {
+                    let group_order = order
+                        .iter()
+                        .position(|&w| w == app.0.controls[&group])
+                        .unwrap();
+                    for (&id, &control) in &app.0.controls {
+                        if id == 3 || id == 4 {
+                            continue;
+                        }
+                        let control_order = order.iter().position(|&w| w == control).unwrap();
+                        assert!(
+                            control_order < group_order,
+                            "Control {id} is covered by group box {group}"
+                        );
+                    }
+                }
+                for (&id, &control) in &app.0.controls {
+                    assert_ne!(
+                        GetUpdateRect(control, null_mut(), 0),
+                        0,
+                        "Control {id} was not invalidated after resize"
+                    );
+                    let mut bounds = RECT::default();
+                    assert_ne!(GetWindowRect(control, &mut bounds), 0);
+                    MapWindowPoints(null_mut(), window, (&mut bounds as *mut RECT).cast(), 2);
+                    assert!(
+                        bounds.right > bounds.left && bounds.bottom > bounds.top,
+                        "Invalid bounds for {id}"
+                    );
+                    if width == 900 {
+                        let expected = &restored_bounds[&id];
+                        assert_eq!(
+                            (bounds.left, bounds.top, bounds.right, bounds.bottom),
+                            (expected.left, expected.top, expected.right, expected.bottom),
+                            "Restored bounds changed for {id}"
+                        );
+                    }
+                }
+                let settings_after = app.0.collect_settings();
+                assert_eq!(settings_after.source_a, settings_before.source_a);
+                assert_eq!(settings_after.source_b, settings_before.source_b);
+                assert_eq!(settings_after.target, settings_before.target);
+                assert_eq!(
+                    settings_after.temporary_directory,
+                    settings_before.temporary_directory
+                );
+                assert_eq!(settings_after.order, settings_before.order);
+                assert_eq!(
+                    settings_after.case_sensitive,
+                    settings_before.case_sensitive
+                );
+                assert_eq!(settings_after.windows_eol, settings_before.windows_eol);
+                assert_eq!(app.0.text(START), "Merge files");
+                assert_eq!(SendMessageW(app.0.controls[&BAR], PBM_GETPOS, 0, 0), 623);
+            }
+            // A DPI transition resizes the parent inside its message handler.
+            // That nested WM_SIZE is intentionally guarded; the explicit final
+            // layout must still resize every child and rebuild the fonts.
+            let initial_dpi = (app.0.scale * 96.0).round() as u32;
+            for dpi in [120, 144, 192, initial_dpi] {
+                let factor = dpi as f64 / 96.0;
+                let suggested = RECT {
+                    left: -32000,
+                    top: -32000,
+                    right: -32000 + (900.0 * factor) as i32,
+                    bottom: -32000 + (820.0 * factor) as i32,
+                };
+                SendMessageW(
+                    window,
+                    WM_DPICHANGED,
+                    (dpi | dpi << 16) as usize,
+                    (&suggested as *const RECT) as isize,
+                );
+                assert_eq!(app.0.scale, factor);
+                let mut field = RECT::default();
+                GetWindowRect(app.0.controls[&SOURCE_A], &mut field);
+                MapWindowPoints(null_mut(), window, (&mut field as *mut RECT).cast(), 2);
+                assert_eq!(field.left, (168.0 * factor).round() as i32);
+                assert_eq!(field.top, (138.0 * factor).round() as i32);
+                assert_eq!(app.0.text(SOURCE_A), settings_before.source_a);
+                assert_eq!(SendMessageW(app.0.controls[&BAR], PBM_GETPOS, 0, 0), 623);
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-# TextMerge 1.0
+# TextMerge 1.0.1
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -81,7 +81,7 @@ artifacts can be removed. Never disconnect a drive during a merge.
 
 Errors are logged to `logs\TextMerge-errors.log` beside the executable, with
 one rotated previous log. If that location is unwritable, the fallback is
-`%LOCALAPPDATA%\TextMerge\logs`. Log entries use UTC Unix seconds. If both
+`%LOCALAPPDATA%\TextMerge\logs`. Log entries use UTC in MySQL format (`YYYY-MM-DD HH:MM:SS`). If both
 locations fail, the GUI still displays the error. The executable has an
 embedded multi-resolution icon, version information, a per-monitor DPI v2
 manifest, and native accessible controls. The build is unsigned; no signing

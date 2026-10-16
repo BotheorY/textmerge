@@ -8,8 +8,8 @@ $packageDirectory = Join-Path $binaryDirectory 'portable\TextMerge'
 $licenseDirectory = Join-Path $packageDirectory 'ThirdPartyLicenses'
 New-Item -ItemType Directory -Force -Path $packageDirectory,$licenseDirectory | Out-Null
 Copy-Item -LiteralPath (Join-Path $binaryDirectory 'TextMerge.exe') -Destination $packageDirectory -Force
-foreach ($name in @('README.md','LICENSE')) {Copy-Item -LiteralPath (Join-Path $projectDirectory $name) -Destination $packageDirectory -Force}
-foreach ($name in @('README.md','LICENSE')) {Copy-Item -LiteralPath (Join-Path $projectDirectory $name) -Destination $binaryDirectory -Force}
+foreach ($name in @('README.md','LICENSE','CHANGELOG.md')) {Copy-Item -LiteralPath (Join-Path $projectDirectory $name) -Destination $packageDirectory -Force}
+foreach ($name in @('README.md','LICENSE','CHANGELOG.md')) {Copy-Item -LiteralPath (Join-Path $projectDirectory $name) -Destination $binaryDirectory -Force}
 $assetDirectory = Join-Path $packageDirectory 'assets'
 New-Item -ItemType Directory -Force -Path $assetDirectory | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectDirectory 'assets\UNICODE-LICENSE.txt') -Destination $assetDirectory -Force
@@ -54,4 +54,19 @@ try {
         if ($file.LastWriteTime.Year -lt 1980) {$file.LastWriteTime=[datetime]'1980-01-01'}
     }
     Compress-Archive -LiteralPath $packageDirectory -DestinationPath (Join-Path $binaryDirectory 'TextMerge-portable.zip') -Force
+    # Source distributions contain the working source, not repository history,
+    # local agent configuration, credentials directories, or build products.
+    $sourceArchivePath = Join-Path $binaryDirectory 'TextMerge-source-MIT.zip'
+    $archiveStream = [System.IO.File]::Create($sourceArchivePath)
+    $archive = [System.IO.Compression.ZipArchive]::new($archiveStream,[System.IO.Compression.ZipArchiveMode]::Create)
+    function Add-SourceDirectory([string]$directory) {
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            if ($item.Name -in @('.git','.codex','.agents','.aws','target')) {continue}
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {continue}
+            if ($item.PSIsContainer) {Add-SourceDirectory $item.FullName; continue}
+            $entryName = $item.FullName.Substring($projectDirectory.Length + 1).Replace('\','/')
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive,$item.FullName,$entryName,[System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+        }
+    }
+    try {Add-SourceDirectory $projectDirectory} finally {$archive.Dispose();$archiveStream.Dispose()}
 } finally {Pop-Location}
